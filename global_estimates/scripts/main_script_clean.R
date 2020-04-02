@@ -14,57 +14,6 @@ hospitalisation_to_death_truncated <- function(x) {
   plnorm(x + 1, muHDT, sigmaHDT) - plnorm(x, muHDT, sigmaHDT)
 }
 
-estimate_underreporting <- function(deaths, cases, underestimation,
-                                    which = c("central", "lower", "upper")) {
-  
-  which <- match.arg(which)
-  
-  baseline_cfr <- switch(which,
-                         central = cCFRBaseline,
-                         lower = cCFREstimateRange[1],
-                         upper = cCFREstimateRange[2])
-  
-  # Estimate underreporting rate according to the following model:
-  #   total_deaths ~ Binomial(total_cases, nCFR)
-  #   nCFR = cCFR * u
-  #   cCFR = baseline_CFR * psi
-  #
-  # where psi is the case reporting rate. So:
-  #   nCFR  = baseline_CFR * u * psi
-  #
-  # baseline_CFR and u are known, so we can estimate psi using Binomial GLM with
-  # an offset term of log(baseline_CFR * u):
-  
-  obs <- cbind(deaths, cases - deaths)
-  log_offset <- log(baseline_cfr / 100) + log(underestimation)
-  m <- glm(obs ~ 1 + offset(log_offset), family = binomial)
-  
-  # return estimate of underreporting:
-  # estimate log(1 / psi) with man and standard error, then convert to
-  # either mean or upper/lower quantile
-  # and constrain with psi
-  # constrained to be less than 1
-  # (can do this in the model fitting instead)
-  
-  # mean and standard error of log(1 / psi):
-  sry <- summary(m)
-  mu <- -sry$coefficients[, "Estimate"]
-  sigma <- sry$coefficients[, "Std. Error"]
-
-  # if we want the central estimate compute mean of 1/psi
-  # otherwise get a quantile of the distribution
-  underreporting <- switch(which,
-                           central = exp(mu + (sigma ^ 2) / 2),
-                           lower = qlnorm(0.025, mu, sigma),
-                           upper = qlnorm(0.975, mu, sigma))
-    
-  # constrain to less than 1
-  underreporting <- min(underreporting, 1)
-  underreporting
-  
-}
-
-
 # Function to work out correction CFR
 scale_cfr <- function(data_1_in, delay_fun){
   case_incidence <- data_1_in$new_cases
@@ -129,38 +78,58 @@ allTogetherClean2 <- allDatDesc %>%
   dplyr::select(-cum_deaths) %>%
   dplyr::do(scale_cfr(., delay_fun = hospitalisation_to_death_truncated)) %>%
   dplyr::filter(cum_known_t > 0 & cum_known_t >= total_deaths)  %>%
-  dplyr::mutate(nCFR_UQ = binom.test(total_deaths, total_cases)$conf.int[2],
-                nCFR_LQ = binom.test(total_deaths, total_cases)$conf.int[1],
-                cCFR_UQ = binom.test(total_deaths, cum_known_t)$conf.int[2],
-                cCFR_LQ = binom.test(total_deaths, cum_known_t)$conf.int[1],
-                underreporting_estimate = estimate_underreporting(total_deaths,
-                                                                  total_cases,
-                                                                  underestimation,
-                                                                  "central"), 
-                lower = estimate_underreporting(total_deaths,
-                                                total_cases,
-                                                underestimation,
-                                                "lower"), 
-                upper = estimate_underreporting(total_deaths,
-                                                total_cases,
-                                                underestimation,
-                                                "upper"), 
-                # underreporting_estimate = cCFRBaseline / (100*cCFR),
-                # lower = cCFREstimateRange[1] / (100 * cCFR_UQ),
-                # upper = cCFREstimateRange[2] / (100 * cCFR_LQ),
-                quantile25 = binom.test(total_deaths, cum_known_t, conf.level = 0.5)$conf.int[1],
-                quantile75 = binom.test(total_deaths, cum_known_t, conf.level = 0.5)$conf.int[2],
-                #bottom = cCFRIQRRange[1] / (100 * quantile75),
-                #top = cCFRIQRRange[2] / (100 * quantile25)
-                ) %>% 
   dplyr::filter(total_deaths > 10)
-                #confidence = dplyr::case_when(total_deaths >= 100 ~ "Countries which have reported 100 or more deaths",
-                #                              total_deaths < 100 && total_deaths > 10  ~ "Countries that have reported fewer than 100 deaths, but more than 10",
-                #                              total_deaths >= 5 && total_deaths <= 10 ~ "Countries that have reported greater than or equal to 5 deaths") %>%
-                #                               
-                # factor(levels = c("Countries which have reported 100 or more deaths",
-                #                   "Countries that have reported fewer than 100 deaths, but more than 10", 
-                #                   "Countries that have reported greater than or equal to 5 deaths"))
+
+# Now estimate the reporting rate of symptomatics for all countries
+# simultaneously, using a Bayesian model with uninformative priors fit by MCMC.
+# Note: there is currently no information shared between the country estimates
+# so this is the same as modelling each country separately. The advantage of
+# modelling them all simultaneously is computational only.
+
+# Using the following model:
+#
+#   total_deaths ~ Binomial(total_cases, nCFR)
+#   nCFR = cCFR * underestimation
+#   cCFR = baseline_CFR / psi
+#
+# where psi is the reporting rate. Underestimation is known, and the (prior)
+# distribution of baseline_CFR is known, so we can estimate psi from this model,
+# incorporating uncertainty in the baseline CFR estimate into the estimates.
+
+library(greta)
+
+n <- nrow(allTogetherClean2)
+deaths <- allTogetherClean2$total_deaths
+cases <- allTogetherClean2$total_cases
+underestimation <- allTogetherClean2$underestimation
+
+# Distribution over plausible baseline CFR values from China study. The 95% CIs
+# are symmetric around the estimate, so we assume it's a an approximately
+# Gaussian distribution, truncated to allowable values. 
+baseline_cfr <- normal(1.38, 0.077, dim = n, truncation = c(0, 1))
+
+# A separate reporting rate for each country, with all reporting rates a priori
+# equally as likely.
+psi <- uniform(0, 1, dim = n)
+
+# Observation model. Equivalent to, but more numerically stable than:
+#   nCFR <- (baseline_cfr / 100) * underestimation / psi
+log_nCFR <- log(baseline_cfr) - log(100) + log(underestimation) - log(psi)
+nCFR <- exp(log_nCFR)
+distribution(deaths) <- binomial(cases, nCFR)
+
+set.seed(2020-04-02)
+m <- model(psi)
+draws <- mcmc(m, chains = 10, n_samples = 3000)
+
+# check convergence before continuing
+coda::gelman.diag(draws)
+sry <- summary(draws)
+
+# summarise estimates
+allTogetherClean2$underreporting_estimate <- sry$statistics[, "Mean"]
+allTogetherClean2$lower <- sry$quantiles[, "2.5%"]
+allTogetherClean2$upper <- sry$quantiles[, "97.5%"]
 
 reportDataFinal <- allTogetherClean2 %>%
   dplyr::select(country, total_cases, total_deaths, underreporting_estimate, lower,
