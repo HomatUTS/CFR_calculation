@@ -9,12 +9,61 @@ cCFRBaseline <- 1.38
 cCFREstimateRange <- c(1.23, 1.53)
 #cCFRIQRRange <- c(1.3, 1.4)
 
-
-
 # Hospitalisation to death distribution
 hospitalisation_to_death_truncated <- function(x) {
   plnorm(x + 1, muHDT, sigmaHDT) - plnorm(x, muHDT, sigmaHDT)
 }
+
+estimate_underreporting <- function(deaths, cases, underestimation,
+                                    which = c("central", "lower", "upper")) {
+  
+  which <- match.arg(which)
+  
+  baseline_cfr <- switch(which,
+                         central = cCFRBaseline,
+                         lower = cCFREstimateRange[1],
+                         upper = cCFREstimateRange[2])
+  
+  # Estimate underreporting rate according to the following model:
+  #   total_deaths ~ Binomial(total_cases, nCFR)
+  #   nCFR = cCFR * u
+  #   cCFR = baseline_CFR * psi
+  #
+  # where psi is the case reporting rate. So:
+  #   nCFR  = baseline_CFR * u * psi
+  #
+  # baseline_CFR and u are known, so we can estimate psi using Binomial GLM with
+  # an offset term of log(baseline_CFR * u):
+  
+  obs <- cbind(deaths, cases - deaths)
+  log_offset <- log(baseline_cfr / 100) + log(underestimation)
+  m <- glm(obs ~ 1 + offset(log_offset), family = binomial)
+  
+  # return estimate of underreporting:
+  # estimate log(1 / psi) with man and standard error, then convert to
+  # either mean or upper/lower quantile
+  # and constrain with psi
+  # constrained to be less than 1
+  # (can do this in the model fitting instead)
+  
+  # mean and standard error of log(1 / psi):
+  sry <- summary(m)
+  mu <- -sry$coefficients[, "Estimate"]
+  sigma <- sry$coefficients[, "Std. Error"]
+
+  # if we want the central estimate compute mean of 1/psi
+  # otherwise get a quantile of the distribution
+  underreporting <- switch(which,
+                           central = exp(mu + (sigma ^ 2) / 2),
+                           lower = qlnorm(0.025, mu, sigma),
+                           upper = qlnorm(0.975, mu, sigma))
+    
+  # constrain to less than 1
+  underreporting <- min(underreporting, 1)
+  underreporting
+  
+}
+
 
 # Function to work out correction CFR
 scale_cfr <- function(data_1_in, delay_fun){
@@ -30,15 +79,28 @@ scale_cfr <- function(data_1_in, delay_fun){
     }
     cumulative_known_t <- cumulative_known_t + known_i # Tally cumulative known
   }
+  
+  total_deaths <- sum(death_incidence)
+  total_cases <- sum(case_incidence)
+  
   # naive CFR value
-  b_tt <- sum(death_incidence)/sum(case_incidence) 
-  # corrected CFR estimator
-  p_tt <- sum(death_incidence)/cumulative_known_t
-  data.frame(nCFR = b_tt, cCFR = p_tt, total_deaths = sum(death_incidence), 
-             cum_known_t = round(cumulative_known_t), total_cases = sum(case_incidence))
+  b_tt <- total_deaths / total_cases
+  
+  # underestimation of CFR due to unknown outcomes
+  u <- cumulative_known_t / total_cases
+  
+  # correct the CFR
+  p_tt <- b_tt / u
+  
+  data.frame(
+    nCFR = b_tt,
+    cCFR = p_tt,
+    underestimation = u,
+    total_deaths = sum(death_incidence),
+    cum_known_t = round(cumulative_known_t),
+    total_cases = sum(case_incidence)
+  )
 }
-
-
 
 
 
@@ -71,9 +133,21 @@ allTogetherClean2 <- allDatDesc %>%
                 nCFR_LQ = binom.test(total_deaths, total_cases)$conf.int[1],
                 cCFR_UQ = binom.test(total_deaths, cum_known_t)$conf.int[2],
                 cCFR_LQ = binom.test(total_deaths, cum_known_t)$conf.int[1],
-                underreporting_estimate = cCFRBaseline / (100*cCFR),
-                lower = cCFREstimateRange[1] / (100 * cCFR_UQ),
-                upper = cCFREstimateRange[2] / (100 * cCFR_LQ),
+                underreporting_estimate = estimate_underreporting(total_deaths,
+                                                                  total_cases,
+                                                                  underestimation,
+                                                                  "central"), 
+                lower = estimate_underreporting(total_deaths,
+                                                total_cases,
+                                                underestimation,
+                                                "lower"), 
+                upper = estimate_underreporting(total_deaths,
+                                                total_cases,
+                                                underestimation,
+                                                "upper"), 
+                # underreporting_estimate = cCFRBaseline / (100*cCFR),
+                # lower = cCFREstimateRange[1] / (100 * cCFR_UQ),
+                # upper = cCFREstimateRange[2] / (100 * cCFR_LQ),
                 quantile25 = binom.test(total_deaths, cum_known_t, conf.level = 0.5)$conf.int[1],
                 quantile75 = binom.test(total_deaths, cum_known_t, conf.level = 0.5)$conf.int[2],
                 #bottom = cCFRIQRRange[1] / (100 * quantile75),
